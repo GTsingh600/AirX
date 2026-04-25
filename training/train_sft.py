@@ -246,31 +246,30 @@ def train_sft(
     )
     print(f"  Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}\n")
 
-    # ── 3. Prepare dataset for SFTTrainer ────────────────────────────────
-    print("[3/4] Preparing dataset...")
+    # ── 3. Prepare dataset — pre-apply chat template → `text` column ────────
+    # Unsloth's compiled SFTTrainer detects the `text` field automatically and
+    # skips the `formatting_func` check entirely.  Pre-processing here avoids
+    # all Unsloth/TRL API drift around formatting_func.
+    print("[3/4] Preparing dataset (applying chat template)...")
     from datasets import Dataset
-    dataset = Dataset.from_list(sft_data)
 
-    # Unsloth SFTTrainer requires a formatting_func when the dataset uses
-    # the `messages` key (chat format).  We apply the tokenizer's chat template
-    # to produce a single formatted string per sample.
-    def _formatting_func(examples):
-        texts = []
-        msgs_batch = examples.get("messages", [])
-        for msgs in msgs_batch:
-            try:
-                text = tokenizer.apply_chat_template(
-                    msgs,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-            except Exception:
-                # Fallback: naive concatenation if template fails
-                text = "\n".join(
-                    f"<|{m['role']}|>\n{m['content']}" for m in msgs
-                )
-            texts.append(text)
-        return texts
+    def _apply_template(sample: dict) -> dict:
+        msgs = sample.get("messages", [])
+        try:
+            text = tokenizer.apply_chat_template(
+                msgs,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        except Exception:
+            text = "".join(
+                f"<|{m['role']}|>\n{m['content']}\n" for m in msgs
+            )
+        return {"text": text}
+
+    processed = [_apply_template(s) for s in sft_data]
+    dataset = Dataset.from_list(processed)
+    print(f"  {len(dataset)} samples, text column ready\n")
 
     # ── 4. Train ─────────────────────────────────────────────────────────
     print(f"[4/4] Starting SFT training ({num_epochs} epochs)...\n")
@@ -286,35 +285,42 @@ def train_sft(
     except Exception:
         pass
 
-    sft_config = SFTConfig(
-        output_dir=output_dir,
-        num_train_epochs=num_epochs,
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUM,
-        learning_rate=LR,
-        warmup_ratio=WARMUP_RATIO,
-        logging_steps=10,
-        save_steps=SAVE_STEPS,
-        save_total_limit=2,
-        seed=seed,
-        bf16=_use_bf16,
-        fp16=not _use_bf16,
-        max_seq_length=MAX_SEQ_LEN,
-        packing=True,
-        report_to="none",
-    )
+    _sft_config_kwargs: dict = {
+        "output_dir":                    output_dir,
+        "num_train_epochs":              num_epochs,
+        "per_device_train_batch_size":   BATCH_SIZE,
+        "gradient_accumulation_steps":   GRAD_ACCUM,
+        "learning_rate":                 LR,
+        "warmup_ratio":                  WARMUP_RATIO,
+        "logging_steps":                 10,
+        "save_steps":                    SAVE_STEPS,
+        "save_total_limit":              2,
+        "seed":                          seed,
+        "bf16":                          _use_bf16,
+        "fp16":                          not _use_bf16,
+        "packing":                       True,
+        "report_to":                     "none",
+    }
+    # max_seq_length lives on SFTConfig in TRL ≥0.9, on TrainingArguments in older
+    _sft_sig = _inspect.signature(SFTConfig.__init__).parameters
+    if "max_seq_length" in _sft_sig:
+        _sft_config_kwargs["max_seq_length"] = MAX_SEQ_LEN
+    else:
+        _sft_config_kwargs["max_length"] = MAX_SEQ_LEN
+
+    sft_config = SFTConfig(**_sft_config_kwargs)
 
     _trainer_kwargs: dict = {
-        "model":           model,
-        "tokenizer":       tokenizer,
-        "train_dataset":   dataset,
-        "formatting_func": _formatting_func,
-        "args":            sft_config,
+        "model":          model,
+        "train_dataset":  dataset,
+        "args":           sft_config,
+        "dataset_text_field": "text",   # point directly at pre-processed column
     }
-    # Some TRL versions use `processing_class` instead of `tokenizer`
-    _sft_sig = _inspect.signature(SFTTrainer.__init__).parameters
-    if "processing_class" in _sft_sig and "tokenizer" not in _sft_sig:
-        _trainer_kwargs["processing_class"] = _trainer_kwargs.pop("tokenizer")
+    # TRL ≥0.9 uses processing_class; older uses tokenizer
+    if "processing_class" in _inspect.signature(SFTTrainer.__init__).parameters:
+        _trainer_kwargs["processing_class"] = tokenizer
+    else:
+        _trainer_kwargs["tokenizer"] = tokenizer
 
     trainer = SFTTrainer(**_trainer_kwargs)
 
