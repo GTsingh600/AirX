@@ -82,17 +82,22 @@ class ChallengeGenerator(ContextAdaptiveCurriculum):
     def record(
         self,
         task_id: str,
-        mutations_used: Optional[List[str]],
-        composite_score: float,
+        mutations_used: Optional[List[str]] = None,
+        composite_score: float = 0.5,
+        *,
+        skill_scores: Optional[Dict[str, float]] = None,
+        composite: Optional[float] = None,
     ) -> None:
-        """Record per-scenario result.
+        """Record per-scenario result — accepts both old and new call signatures.
 
-        Old interface accepted (task_id, mutations_used, composite_score).
-        New interface expects per-skill scores. We approximate skill scores
-        from the composite for backward compatibility.
+        Old: record(task_id, mutations_used, composite_score)
+        New: record(task_id, skill_scores={...}, composite=0.6)
         """
-        skill_scores = {dim: composite_score for dim in SKILL_DIMENSIONS}
-        super().record(task_id=task_id, skill_scores=skill_scores, composite=composite_score)
+        # New-style call via keyword args takes precedence
+        final_composite = composite if composite is not None else composite_score
+        if skill_scores is None:
+            skill_scores = {dim: final_composite for dim in SKILL_DIMENSIONS}
+        super().record(task_id=task_id, skill_scores=skill_scores, composite=final_composite)
 
     def mutate(
         self,

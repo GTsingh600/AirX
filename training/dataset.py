@@ -266,6 +266,7 @@ def build_episode_dataset(
     include_supervisor: bool = True,
     include_adapt: bool = True,
     domain_episode_ratio: float = 0.30,
+    long_horizon_ratio: float = 0.25,
 ) -> List[Dict[str, Any]]:
     """Build full multi-agent training dataset.
 
@@ -276,6 +277,8 @@ def build_episode_dataset(
     If include_adapt: ~30% of episodes are domain-transfer episodes (ICU tasks).
       Each domain episode emits: 1 ADAPT sample + 1 AMAN sample + 1 DMAN sample
       on the ADAPT-mapped task (so AMAN/DMAN see correctly-parameterised flights).
+    long_horizon_ratio: fraction of ATC episodes that use cascade mutations to
+      simulate multi-epoch planning pressure (long-horizon Theme #2 training signal).
     """
     import random
     rng = random.Random(seed)
@@ -361,8 +364,19 @@ def build_episode_dataset(
         profile = supervisor.sample_profile(ep_id)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
-        # Apply generator mutation (rule-based for dataset generation)
-        mutated_task, is_solvable = generator.mutate(base_task)
+        # Apply adaptive curriculum mutation
+        mutated_task, is_solvable, adapt_ctx = generator.adapt(base_task)
+
+        # Long-horizon: 25% of ATC episodes get a cascade injection — a Heavy at
+        # the planning boundary forces agents to reason across epoch boundaries.
+        is_long_horizon_ep = rng.random() < long_horizon_ratio
+        if is_long_horizon_ep:
+            try:
+                mutated_task, _, _ = generator.adapt(
+                    base_task, long_horizon=True
+                )
+            except Exception:
+                pass  # fall back to standard mutated task on any error
 
         aman_obs, dman_obs = env.reset(
             episode_id=ep_id,
@@ -413,8 +427,16 @@ def build_episode_dataset(
                 sup_desc=sup_desc,
             ))
 
-        # Simulate a mid-score episode to update generator curriculum
-        generator.update(rng.uniform(0.25, 0.75))
+        # Update adaptive curriculum with simulated skill scores
+        sim_score = rng.uniform(0.25, 0.75)
+        generator.record(
+            task_id=base_task.task_id,
+            skill_scores={d: rng.uniform(0.25, 0.80) for d in [
+                "conflict_avoidance", "delay_efficiency", "emergency_handling",
+                "atfm_compliance", "coverage", "coordination", "fairness",
+            ]},
+            composite=sim_score,
+        )
 
     return samples
 

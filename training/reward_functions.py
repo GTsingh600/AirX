@@ -1017,19 +1017,32 @@ def adapt_reward_fn(completions: List[Any], **kwargs) -> List[float]:
         mapped_types = set(action.entity_wake_map.keys()) | set(action.entity_priority_map.keys())
         coverage = len(entity_types & mapped_types) / max(1, len(entity_types))
 
-        # ── Rationale bonus: cite numbers? ────────────────────────────────────
+        # ── Rationale quality: cites numbers AND explains mapping logic ───────
         rationale = action.rationale or ""
         import re as _re
-        has_numbers = bool(_re.search(r"\d+\.\d+", rationale))
-        rationale_bonus = 0.05 if (len(rationale) >= 30 and has_numbers) else 0.0
+        has_numbers  = bool(_re.search(r"\d+\.\d+", rationale))
+        has_mapping  = any(w in rationale.lower() for w in
+                           ("wake", "priority", "emergency", "medical", "time_pressure",
+                            "connection_risk", "urgency", "map", "infer"))
+        rationale_bonus = 0.0
+        if len(rationale) >= 30 and has_numbers:
+            rationale_bonus += 0.05
+        if len(rationale) >= 60 and has_mapping:
+            rationale_bonus += 0.05   # extra for explaining WHY, not just numbers
 
-        # ── Compose reward ────────────────────────────────────────────────────
-        improvement = downstream - baseline_composite          # positive = LLM beat heuristic
+        # ── Budget adherence: penalise degenerate distributions ───────────────
+        distribution_penalty = _adapt_distribution_penalty(action)
+
+        # ── Compose ADAPT reward — boosted improvement signal ─────────────────
+        improvement = downstream - baseline_composite  # + = LLM beat heuristic
+        # Weights: downstream performance is primary, improvement margin amplified,
+        # coverage ensures all entity types mapped, rationale rewards reasoning quality.
         reward = (
-            0.70 * downstream
-            + 0.15 * max(-1.0, min(1.0, improvement))
-            + 0.10 * coverage
-            + rationale_bonus
+            0.55 * downstream                               # operational quality
+            + 0.25 * max(-1.0, min(1.0, improvement))      # margin over heuristic (boosted)
+            + 0.10 * coverage                               # completeness
+            + rationale_bonus                               # up to 0.10
+            - distribution_penalty                          # penalise emergency overuse
         )
         reward = max(-1.0, min(1.0, reward))
 

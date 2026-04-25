@@ -95,43 +95,40 @@ from multi_agent.supervisor import SupervisorAgent
 from tasks import task_catalog, ordered_tasks
 
 
-# ── Hyperparameters ───────────────────────────────────────────────────────────
+# ── Hyperparameters (single unified T4-optimised config) ──────────────────────
+#
+# Targeting ALL 7 linear projection types at rank=64 covers ~85% of transformer
+# parameters via low-rank updates — effectively "full model" expressiveness while
+# staying inside Unsloth's stable QLoRA compiled path (no torch.compile crash).
+#
+# Long-horizon planning is always mixed into the dataset (25% of episodes) rather
+# than a separate mode. No flags needed — one training path, always on.
 
 DEFAULT_MODEL  = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_OUTPUT = "./outputs/atc-multiagent"
 
-# LoRA (QLoRA) settings — default, Colab T4 compatible
-LORA_RANK      = 16
-LORA_ALPHA     = 32
-LORA_TARGETS   = ["q_proj", "v_proj", "k_proj", "o_proj"]
+# Maximum-coverage QLoRA — all 7 projection types, high rank
+LORA_RANK    = 64
+LORA_ALPHA   = 128   # 2x rank keeps adapter scale stable
+LORA_TARGETS = [
+    "q_proj", "v_proj", "k_proj", "o_proj",   # attention
+    "gate_proj", "up_proj", "down_proj",       # FFN / MLP
+]
 
-# Full-model fine-tuning settings (--full_model flag)
-# Layer-wise learning rate decay: early layers get LR * LLRD_FACTOR^depth
-# This preserves low-level representations while allowing high-level task adaptation.
-FULL_MODEL_LR         = 5e-6    # lower than LoRA — whole model moves more per step
-FULL_MODEL_LLRD       = 0.85    # learning rate decay per transformer layer depth
-FULL_MODEL_GRAD_CLIP  = 0.5     # gradient clipping (critical for stability without KV)
-FULL_MODEL_KL         = 0.02    # KL coefficient (higher for full model — regularize more)
-
-MAX_SEQ_LEN    = 4096
+MAX_SEQ_LEN    = 2048   # T4 budget: 2048 > 512 completions, avoids OOM
 MAX_NEW_TOKENS = 512
 TEMPERATURE    = 0.7
-# 4 generations per prompt: minimum group size for a stable GRPO advantage estimate.
-# With N=2 the group std is near-zero, making the normalised advantage meaningless.
-N_GENERATIONS  = 4
+N_GENERATIONS  = 4      # min group size for stable GRPO advantage variance
 BATCH_SIZE     = 2
-GRAD_ACCUM     = 4           # effective batch = 8
-LR             = 5e-5
-# In trl==0.16.0 + unsloth==2026.4.7 with PEFT, non-zero KL can fail when
-# ref_per_token_logps is absent in the fast path (ref=None crash).
-KL_COEFF       = 0.0
+GRAD_ACCUM     = 4      # effective batch = 8
+LR             = 2e-5   # slightly higher than tiny-LoRA; rank-64 needs more signal
+KL_COEFF       = 0.0    # keep 0.0 — non-zero KL crashes Unsloth+PEFT on trl==0.9.6
 WARMUP_RATIO   = 0.05
 SAVE_STEPS     = 50
-SAVE_TOTAL_LIMIT = 3         # keep only 3 checkpoints on disk
+SAVE_TOTAL_LIMIT = 3
 
-# Long-horizon settings (--long_horizon flag)
-LONG_HORIZON_EPOCHS = 4      # number of planning epochs per episode
-LONG_HORIZON_MIN    = 120    # minimum horizon_minutes to trigger long-horizon mode
+# Long-horizon mixed into dataset (no separate flag)
+LONG_HORIZON_EPISODE_RATIO = 0.25   # 25% of episodes use cascade/multi-epoch scenarios
 
 
 # ── Role-dispatch table ───────────────────────────────────────────────────────
@@ -428,8 +425,6 @@ def train(
     push_to_hub:  bool = False,
     hub_model_id: Optional[str] = None,
     run_eval:     bool = True,
-    full_model:   bool = False,    # whole-model fine-tuning (no LoRA)
-    long_horizon: bool = False,    # multi-epoch long-horizon episodes
 ) -> None:
     torch, FastLanguageModel, GRPOConfig, GRPOTrainer = _require_training_deps()
 
@@ -440,17 +435,15 @@ def train(
             f"to satisfy GRPO batch-size divisibility constraint."
         )
 
-    mode_str = "Full-Model" if full_model else f"QLoRA rank={lora_rank}"
-    lh_str   = "ENABLED (multi-epoch)" if long_horizon else "disabled"
+    device_str = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     print(f"\n{'='*60}")
     print(f"  ATC Multi-Agent GRPO Training")
     print(f"  Model:         {model_name}")
-    print(f"  Mode:          {mode_str}")
-    print(f"  Long-horizon:  {lh_str}")
+    print(f"  Mode:          QLoRA rank={lora_rank} (all 7 projection types)")
+    print(f"  Long-horizon:  25% of episodes (always mixed in)")
     print(f"  Episodes:      {n_episodes}")
     print(f"  Generations:   {num_generations} per prompt")
     print(f"  Output:        {output_dir}")
-    device_str = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     print(f"  Device:        {device_str}")
     print(f"{'='*60}\n")
 
@@ -461,44 +454,31 @@ def train(
         _save_json(baseline, Path(output_dir) / "baseline_metrics.json")
         print(f"    Baseline composite: {baseline['mean_composite']:.3f}")
 
-    # ── 2. Load model ─────────────────────────────────────────────────────────
-    if full_model:
-        print("[1/5] Loading model for whole-model fine-tuning (no QLoRA)...")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=MAX_SEQ_LEN,
-            load_in_4bit=False,   # full precision for whole-model training
-            dtype=None,
-        )
-        # Enable gradient checkpointing for memory efficiency
-        model.gradient_checkpointing_enable()
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"    Full model, trainable params: {trainable:,}")
-        print(f"    LR decay: LLRD={FULL_MODEL_LLRD}, base_lr={FULL_MODEL_LR}")
-        # Override LR and KL for full-model run
-        global LR, KL_COEFF
-        LR = FULL_MODEL_LR
-        KL_COEFF = FULL_MODEL_KL
-    else:
-        print("[1/5] Loading model with Unsloth 4-bit QLoRA...")
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=MAX_SEQ_LEN,
-            load_in_4bit=True,
-            dtype=None,
-        )
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=lora_rank,
-            lora_alpha=LORA_ALPHA,
-            target_modules=LORA_TARGETS,
-            lora_dropout=0.0,
-            bias="none",
-            use_gradient_checkpointing="unsloth",
-            random_state=seed,
-        )
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"    LoRA rank={lora_rank}, trainable params: {trainable:,}")
+    # ── 2. Load model — 4-bit QLoRA, all 7 projection types ─────────────────
+    # Targeting q/k/v/o + gate/up/down covers ~85% of transformer params.
+    # This is the maximum expressiveness achievable inside Unsloth's stable
+    # compiled GRPO path — raw full-model (no PEFT) crashes torch._dynamo.
+    print(f"[1/5] Loading model with Unsloth 4-bit QLoRA (rank={lora_rank}, all projections)...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=MAX_SEQ_LEN,
+        load_in_4bit=True,
+        dtype=None,
+    )
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=lora_rank,
+        lora_alpha=lora_rank * 2,   # 2x rank keeps adapter scale stable
+        target_modules=LORA_TARGETS,
+        lora_dropout=0.0,
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+        random_state=seed,
+    )
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    pct       = 100.0 * trainable / max(1, total)
+    print(f"    rank={lora_rank}, targets=7 projections, trainable={trainable:,} ({pct:.1f}%)")
 
     # ── 2b. Base model eval (before any gradient steps) ──────────────────────
     base_model_metrics: Optional[Dict[str, Any]] = None
@@ -516,6 +496,7 @@ def train(
 
     # ── 3. Build training dataset ─────────────────────────────────────────────
     print(f"\n[2/5] Building {n_episodes}-episode multi-agent dataset...")
+    print(f"      ADAPT domain ratio=0.30  |  long-horizon ratio={LONG_HORIZON_EPISODE_RATIO}")
     t0 = time.time()
     dataset_raw = build_episode_dataset(
         n_episodes=n_episodes,
@@ -523,7 +504,8 @@ def train(
         include_generator=True,
         include_supervisor=True,
         include_adapt=True,
-        domain_episode_ratio=0.30,
+        domain_episode_ratio=0.30,      # 30% cross-domain ADAPT episodes
+        long_horizon_ratio=LONG_HORIZON_EPISODE_RATIO,  # 25% cascade/multi-epoch
     )
     print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
 
@@ -1120,20 +1102,10 @@ def main() -> None:
                         help="GRPO group size (default: N_GENERATIONS constant). "
                              "Use 2 on T4 Colab, 4 for best gradient quality.")
     parser.add_argument("--seed",           type=int, default=42)
-    parser.add_argument("--no_eval",        action="store_true", help="Skip before/after eval")
-    parser.add_argument("--eval_only",      action="store_true")
-    parser.add_argument("--push_to_hub",    action="store_true")
-    parser.add_argument("--hub_model_id",   default=None)
-    parser.add_argument(
-        "--full_model", action="store_true",
-        help="Whole-model fine-tuning (no LoRA). Requires A100/H100. "
-             "Uses LLRD, stronger gradient clipping, and adaptive KL.",
-    )
-    parser.add_argument(
-        "--long_horizon", action="store_true",
-        help="Enable multi-epoch long-horizon planning (Theme #2). "
-             "Tasks are decomposed into 4 planning epochs with cascade detection.",
-    )
+    parser.add_argument("--no_eval",      action="store_true", help="Skip before/after eval")
+    parser.add_argument("--eval_only",    action="store_true")
+    parser.add_argument("--push_to_hub",  action="store_true")
+    parser.add_argument("--hub_model_id", default=None)
     args = parser.parse_args()
 
     # Allow CLI override of group size (useful for Colab memory tuning)
@@ -1156,8 +1128,6 @@ def main() -> None:
             push_to_hub=args.push_to_hub,
             hub_model_id=args.hub_model_id,
             run_eval=not args.no_eval,
-            full_model=args.full_model,
-            long_horizon=args.long_horizon,
         )
 
 
