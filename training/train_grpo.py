@@ -864,7 +864,6 @@ def _run_model_episodes(
 
     client = _LocalModelClient(model, tokenizer)
     env = MultiAgentATCEnvironment(seed=77)
-    gen = ChallengeGenerator(seed=77)
     sup = SupervisorAgent()
 
     # Two representative tasks: one easy, one hard
@@ -879,10 +878,10 @@ def _run_model_episodes(
                 task_id=task_id,
                 client=client,
                 env=env,
-                generator=gen if use_generator else None,
+                generator=None,
                 supervisor=sup,
                 episode_id=ep,
-                use_generator=use_generator,
+                use_generator=False,
                 model_name="local",
             )
             composites.append(float(r.get("composite", 0)))
@@ -986,7 +985,6 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
     from training.dataset import AMAN_SYSTEM, DMAN_SYSTEM, SUPERVISOR_PROFILES
 
     env        = MultiAgentATCEnvironment(seed=seed)
-    generator  = ChallengeGenerator(seed=seed)
     supervisor = SupervisorAgent()
     task_list  = list(ordered_tasks())
     rng        = random.Random(seed)
@@ -994,15 +992,13 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
     results: Dict[str, List] = {
         "aman_rewards": [], "dman_rewards": [], "composite_scores": [],
         "conflict_counts": [], "coordination_scores": [],
-        "generator_difficulty": [],
     }
 
     for ep in range(n_episodes):
         base_task = rng.choice(task_list)
         profile   = supervisor.sample_profile(ep)
-        mutated, is_solvable = generator.mutate(base_task)
 
-        aman_obs, dman_obs = env.reset(episode_id=ep, mutated_task=mutated)
+        aman_obs, dman_obs = env.reset(episode_id=ep, mutated_task=base_task)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
         def _chat(system, user):
@@ -1033,20 +1029,17 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
             env.step_negotiate(aman_action, dman_action)
 
         result = env.finalize()
-        generator.update(result.composite_score)
 
         results["aman_rewards"].append(result.aman_reward)
         results["dman_rewards"].append(result.dman_reward)
         results["composite_scores"].append(result.composite_score)
         results["conflict_counts"].append(result.per_role.cross_lane_conflicts)
         results["coordination_scores"].append(result.per_role.coordination_score)
-        results["generator_difficulty"].append(generator.difficulty_level)
 
         print(
             f"  ep{ep:3d} | composite={result.composite_score:.3f} | "
             f"AMAN={result.aman_reward:.3f} | DMAN={result.dman_reward:.3f} | "
-            f"coord={result.per_role.coordination_score:.3f} | "
-            f"gen_lvl={generator.difficulty_level}"
+            f"coord={result.per_role.coordination_score:.3f}"
         )
 
     def _mean(lst):
@@ -1058,7 +1051,6 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
         "mean_dman_reward":  _mean(results["dman_rewards"]),
         "mean_coordination": _mean(results["coordination_scores"]),
         "mean_conflicts":    _mean(results["conflict_counts"]),
-        "final_gen_difficulty": results["generator_difficulty"][-1] if results["generator_difficulty"] else 1,
     }
     print("\n=== EVALUATION SUMMARY ===")
     for k, v in summary.items():
