@@ -344,9 +344,95 @@ TASKS: List[TaskDefinition] = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MICRO TASKS — simplified 5-6 flight versions for 1.5B ADAPT-first training.
+# Short context (~400 tokens) so AMAN/DMAN format-learning episodes don't
+# overflow 1.5B's 1024-token budget.  Not used for evaluation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MICRO_TASKS: List[TaskDefinition] = [
+    # ── Micro Easy: Delhi 5-flight single-runway ──────────────────────────────
+    TaskDefinition(
+        task_id="micro_delhi_easy",
+        title="Delhi Micro: Morning Rush",
+        difficulty=Difficulty.EASY,
+        airport="VIDP",
+        description="Short morning recovery — 5 flights, 1 runway, one medical.",
+        objective="Conflict-free schedule with medical departure protected.",
+        grading_focus=["Medical protected", "Zero conflicts", "Low delay"],
+        planning_horizon_minutes=60,
+        max_steps=3,
+        delay_budget=60,
+        fuel_budget=400.0,
+        fairness_tolerance=15.0,
+        runways=[
+            RunwaySpec(
+                runway_id="27L",
+                allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
+                hourly_capacity=18,
+                weather_penalty=1.1,
+                notes="Single active runway.",
+            ),
+        ],
+        flights=[
+            _f("IGO601", "IGO", OperationType.DEPARTURE, WakeClass.MEDIUM,  5,  5, 30, ["27L"], 180, 2.6),
+            _f("AIC221", "AIC", OperationType.ARRIVAL,   WakeClass.MEDIUM, 10, 10, 35, ["27L"], 168, 4.8, PriorityClass.CONNECTION, 0.6, "Connection bank."),
+            _f("MED01",  "GOV", OperationType.DEPARTURE, WakeClass.MEDIUM, 14, 14, 30, ["27L"],   6, 2.8, PriorityClass.MEDICAL, 0.2, "Medical cargo onboard."),
+            _f("VTI404", "VTI", OperationType.ARRIVAL,   WakeClass.MEDIUM, 18, 18, 42, ["27L"], 156, 5.2),
+            _f("AKJ118", "AKJ", OperationType.DEPARTURE, WakeClass.MEDIUM, 22, 22, 45, ["27L"], 150, 2.4),
+        ],
+    ),
+
+    # ── Micro Medium: Mumbai 6-flight, 2-runway, 1 Heavy ─────────────────────
+    TaskDefinition(
+        task_id="micro_mumbai_medium",
+        title="Mumbai Micro: Hub Bank",
+        difficulty=Difficulty.MEDIUM,
+        airport="VABB",
+        description="6-flight hub balance — 1 HEAVY arrival, wake-class asymmetry.",
+        objective="Protect connection arrival, exploit wake asymmetry for throughput.",
+        grading_focus=["Heavy wake spacing", "Connection arrival first", "Low delay"],
+        planning_horizon_minutes=70,
+        max_steps=3,
+        delay_budget=80,
+        fuel_budget=600.0,
+        fairness_tolerance=14.0,
+        runways=[
+            RunwaySpec(
+                runway_id="27",
+                allowed_operations=[OperationType.ARRIVAL, OperationType.DEPARTURE],
+                hourly_capacity=20,
+                weather_penalty=1.0,
+                notes="Primary mixed runway.",
+            ),
+            RunwaySpec(
+                runway_id="14",
+                allowed_operations=[OperationType.DEPARTURE],
+                hourly_capacity=14,
+                weather_penalty=1.0,
+                notes="Departure-only overflow.",
+            ),
+        ],
+        flights=[
+            _f("IGO202", "IGO", OperationType.DEPARTURE, WakeClass.MEDIUM,  5,  5, 40, ["14", "27"], 186, 2.4),
+            _f("AIC540", "AIC", OperationType.ARRIVAL,   WakeClass.HEAVY,  10, 10, 32, ["27"],        264, 6.1, PriorityClass.CONNECTION, 0.8, "Long-haul inbound connection bank."),
+            _f("VTI313", "VTI", OperationType.DEPARTURE, WakeClass.MEDIUM, 14, 14, 50, ["14"],        176, 2.5, PriorityClass.CONNECTION, 0.7),
+            _f("AKJ440", "AKJ", OperationType.DEPARTURE, WakeClass.MEDIUM, 18, 18, 55, ["14", "27"], 172, 2.4),
+            _f("IGO558", "IGO", OperationType.ARRIVAL,   WakeClass.MEDIUM, 22, 22, 45, ["27"],        181, 5.0),
+            _f("AIC845", "AIC", OperationType.ARRIVAL,   WakeClass.HEAVY,  28, 28, 50, ["27"],        248, 6.3, PriorityClass.CONNECTION, 0.7, "Fuel-sensitive inbound."),
+        ],
+    ),
+]
+
+
 def task_catalog() -> Dict[str, TaskDefinition]:
     """Return all tasks keyed by task_id."""
     return {t.task_id: t for t in TASKS}
+
+
+def micro_task_catalog() -> Dict[str, TaskDefinition]:
+    """Return simplified micro tasks for 1.5B ADAPT-first training."""
+    return {t.task_id: t for t in MICRO_TASKS}
 
 
 def ordered_tasks() -> Iterable[TaskDefinition]:

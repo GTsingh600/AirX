@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models import OperationType, SlotAssignment
-from tasks import task_catalog, ordered_tasks
+from tasks import task_catalog, ordered_tasks, micro_task_catalog
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.generator import ChallengeGenerator
 from multi_agent.models import (
@@ -40,7 +40,6 @@ from multi_agent.models import (
     SupervisorProfileName,
     SUPERVISOR_PROFILES,
 )
-from multi_agent.supervisor import SupervisorAgent
 from multi_agent.adapt import (
     apply_adapt_mapping,
     build_adapt_observation,
@@ -265,24 +264,26 @@ def build_episode_dataset(
     include_generator: bool = False,
     include_supervisor: bool = False,
     include_adapt: bool = True,
-    domain_episode_ratio: float = 0.50,
+    domain_episode_ratio: float = 0.65,
     long_horizon_ratio: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """Build ADAPT-focused multi-agent training dataset.
+    """Build ADAPT-first multi-agent training dataset.
 
-    ADAPT is the primary training role (~50% of samples).
-    AMAN + DMAN are support roles (~25% each) that teach JSON format.
+    ADAPT is the PRIMARY training role (~65% of samples).
+    AMAN + DMAN use micro tasks (5-6 flights) for short-context format learning.
 
     Training mix:
-      - 50% domain-transfer episodes: 1 ADAPT + 1 AMAN + 1 DMAN = 3 samples
-      - 50% regular ATC episodes: 1 AMAN + 1 DMAN = 2 samples
+      - 65% domain-transfer episodes: 1 ADAPT + 1 AMAN + 1 DMAN = 3 samples
+      - 35% regular ATC micro episodes: 1 AMAN + 1 DMAN = 2 samples
       - Generator and Supervisor disabled by default
     """
     import random
     rng = random.Random(seed)
     catalog = task_catalog()
-    task_list = list(ordered_tasks())
-    supervisor = SupervisorAgent()
+    # Use micro tasks for AMAN/DMAN format-learning — short context, 1.5B-friendly
+    micro_catalog = micro_task_catalog()
+    task_list = list(micro_catalog.values()) if micro_catalog else list(ordered_tasks())
+    _profiles = list(SupervisorProfileName)
     env = MultiAgentATCEnvironment(seed=seed)
 
     # Lazy-import ICU domain to avoid circular dependencies
@@ -308,7 +309,7 @@ def build_episode_dataset(
 
         if is_domain_ep:
             domain_task = rng.choice(domain_tasks)
-            profile = supervisor.sample_profile(ep_id)
+            profile = _profiles[ep_id % len(_profiles)]
 
             # Build ADAPT observation and heuristic action
             adapt_obs = build_adapt_observation(
@@ -359,7 +360,7 @@ def build_episode_dataset(
 
         # Regular ATC episode — use base tasks with domain randomisation
         base_task = rng.choice(task_list)
-        profile = supervisor.sample_profile(ep_id)
+        profile = _profiles[ep_id % len(_profiles)]
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
         aman_obs, dman_obs = env.reset(

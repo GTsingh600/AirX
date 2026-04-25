@@ -266,7 +266,7 @@ def _build_adapt_heuristic(obs: ADAPTObservation, task: TaskDefinition) -> ADAPT
 
 def build_adapt_observation(
     task: TaskDefinition,
-    profile: SupervisorProfileName,
+    profile: SupervisorProfileName = SupervisorProfileName.SAFETY_STRICT,
     domain_name: Optional[str] = None,
     domain_description: Optional[str] = None,
 ) -> ADAPTObservation:

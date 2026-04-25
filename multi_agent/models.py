@@ -46,18 +46,6 @@ class MessageType(str, Enum):
     CONFLICT_FLAG   = "conflict_flag"      # environment injects this
 
 
-class SlotProposal(BaseModel):
-    """An alternative slot a negotiating agent is willing to accept."""
-
-    flight_id: str
-    runway_id: str
-    minute: int
-    delay_cost: float = Field(
-        default=0.0,
-        description="Self-reported cost of accepting this alternative (minutes of delay)",
-    )
-
-
 class NegotiationMessage(BaseModel):
     from_role:       AgentRole
     message_type:    MessageType
@@ -67,25 +55,6 @@ class NegotiationMessage(BaseModel):
     priority:        PriorityClass
     reason:          str
     is_emergency:    bool = False
-    # Richer negotiation fields — enable more expressive coordination
-    content: str = Field(
-        default="",
-        description="Free-form natural language explanation beyond the reason field",
-    )
-    proposed_alternatives: List[SlotProposal] = Field(
-        default_factory=list,
-        description="Alternative slots this agent is willing to accept instead",
-    )
-    confidence: float = Field(
-        default=1.0,
-        ge=0.0,
-        le=1.0,
-        description="Agent's certainty that this request/yield is correct",
-    )
-    theory_of_mind_claim: str = Field(
-        default="",
-        description="Agent's explicit prediction about the other agent's constraint or intent",
-    )
 
 
 # ── Agent actions ─────────────────────────────────────────────────────────────
@@ -377,22 +346,11 @@ class MultiAgentObservation(BaseModel):
 
     def to_prompt_text(self) -> str:
         """Render observation as structured text for LLM input."""
-        prof = SUPERVISOR_PROFILES[self.supervisor_profile_name]
-        weight_str = (
-            f"conflict={prof['conflict_weight']:.1f}x  "
-            f"delay={prof['delay_weight']:.1f}x  "
-            f"fuel={prof['fuel_weight']:.1f}x  "
-            f"fairness={prof['fairness_weight']:.1f}x  "
-            f"priority={prof['priority_weight']:.1f}x"
-        )
         lines = [
             f"=== {self.role.value} OBSERVATION — {self.airport} ===",
             f"Task: {self.task_id}",
             f"Round: {self.round_type.value.upper()} ({self.round_number}/2)",
             f"Steps remaining: {self.steps_remaining}",
-            "",
-            f"SUPERVISOR TODAY: {self.supervisor_description}",
-            f"SUPERVISOR WEIGHTS: {weight_str}",
             "",
         ]
 
@@ -428,22 +386,11 @@ class MultiAgentObservation(BaseModel):
             lines.append("MESSAGES FROM OTHER AGENT:")
             for msg in self.incoming_messages:
                 tag = " [EMERGENCY]" if msg.is_emergency else ""
-                conf_str = f" conf={msg.confidence:.1f}" if msg.confidence < 1.0 else ""
                 lines.append(
-                    f"  [{msg.from_role.value} → {msg.message_type.value}]{tag}{conf_str} "
+                    f"  [{msg.from_role.value} → {msg.message_type.value}]{tag} "
                     f"{msg.flight_id} @ runway {msg.runway_id} T+{msg.requested_minute} "
                     f"({msg.priority.value}): {msg.reason}"
                 )
-                if msg.content:
-                    lines.append(f"    Detail: {msg.content}")
-                if msg.theory_of_mind_claim:
-                    lines.append(f"    Prediction: {msg.theory_of_mind_claim}")
-                if msg.proposed_alternatives:
-                    alts = ", ".join(
-                        f"{a.flight_id}@{a.runway_id}+{a.minute}min(cost={a.delay_cost:.0f})"
-                        for a in msg.proposed_alternatives
-                    )
-                    lines.append(f"    Alternatives offered: {alts}")
 
         if self.conflict_log:
             lines.append("")

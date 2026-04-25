@@ -34,7 +34,6 @@ from training.dataset import (
 )
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.models import AgentRole, SupervisorProfileName
-from multi_agent.supervisor import SupervisorAgent
 from multi_agent.inference import _build_aman_heuristic, _build_dman_heuristic
 from multi_agent.adapt import (
     build_adapt_observation,
@@ -47,13 +46,15 @@ from tasks import task_catalog, ordered_tasks
 
 DEFAULT_MODEL  = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_OUTPUT = "./outputs/sft-warmup"
-LORA_RANK      = 32
-LORA_ALPHA     = 64
+# rank=16 for SFT: slightly higher than GRPO (rank=8) since SFT uses imitation
+# loss which benefits from more capacity.  Still comfortable on T4 at seq=1024.
+LORA_RANK      = 16
+LORA_ALPHA     = 32
 LORA_TARGETS   = [
     "q_proj", "v_proj", "k_proj", "o_proj",
     "gate_proj", "up_proj", "down_proj",
 ]
-MAX_SEQ_LEN    = 1536
+MAX_SEQ_LEN    = 1024   # matches GRPO budget; covers all micro+ADAPT prompts
 LR             = 2e-5   # SFT can use higher LR than GRPO
 BATCH_SIZE     = 2
 GRAD_ACCUM     = 4      # effective batch = 8
@@ -84,8 +85,11 @@ def build_sft_dataset(n_episodes: int = 50, seed: int = 42) -> List[Dict[str, An
     """
     import random
     rng = random.Random(seed)
-    task_list = list(ordered_tasks())
-    supervisor = SupervisorAgent()
+    # Use micro tasks for AMAN/DMAN — 5-6 flights each, fits in 1024-token budget
+    from tasks import micro_task_catalog
+    micro_catalog = micro_task_catalog()
+    task_list = list(micro_catalog.values()) if micro_catalog else list(ordered_tasks())
+    _profiles = list(SupervisorProfileName)
     env = MultiAgentATCEnvironment(seed=seed)
 
     # Also load domain tasks for ADAPT
@@ -98,11 +102,13 @@ def build_sft_dataset(n_episodes: int = 50, seed: int = 42) -> List[Dict[str, An
     samples: List[Dict[str, Any]] = []
 
     for ep_id in range(n_episodes):
-        profile = supervisor.sample_profile(ep_id)
+        profile = _profiles[ep_id % len(_profiles)]
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]
 
         # ── Decide: domain episode (ADAPT) or ATC episode ─────────────────
-        is_domain = rng.random() < 0.50 and domain_tasks
+        # 65% ADAPT: SFT teaches the model the simpler ADAPT schema first.
+        # AMAN/DMAN learn format via micro tasks (short context).
+        is_domain = rng.random() < 0.65 and domain_tasks
 
         if is_domain:
             # ADAPT sample
@@ -295,8 +301,8 @@ def main():
     parser.add_argument("--model",      default=DEFAULT_MODEL,
                         help="Base model (default: Qwen/Qwen2.5-1.5B-Instruct)")
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT)
-    parser.add_argument("--episodes",   type=int, default=50,
-                        help="Number of episodes for SFT data (each → 2-3 samples)")
+    parser.add_argument("--episodes",   type=int, default=30,
+                        help="Number of episodes for SFT data (each → 2-3 samples); 30 is enough for 1.5B")
     parser.add_argument("--epochs",     type=int, default=NUM_EPOCHS)
     parser.add_argument("--lora_rank",  type=int, default=LORA_RANK)
     parser.add_argument("--seed",       type=int, default=42)

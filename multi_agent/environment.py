@@ -46,7 +46,6 @@ try:
         SupervisorProfileName,
         SUPERVISOR_PROFILES,
     )
-    from .supervisor import SupervisorAgent
 except ImportError:
     from engine import empty_metrics, simulate_plan
     from graders import GatedCompositeGrader, SafetyGateEvaluator, grade_task
@@ -73,7 +72,6 @@ except ImportError:
         SupervisorProfileName,
         SUPERVISOR_PROFILES,
     )
-    from multi_agent.supervisor import SupervisorAgent
 
 
 MAX_NEGOTIATE_ROUNDS = 2   # max negotiation passes before forced merge
@@ -125,7 +123,6 @@ class MultiAgentATCEnvironment:
 
     def __init__(self, seed: int = 42) -> None:
         self._catalog: Dict[str, TaskDefinition] = task_catalog()
-        self._supervisor = SupervisorAgent()
         self._rng = random.Random(seed)
         self._state: Optional[EpisodeState] = None
 
@@ -157,7 +154,7 @@ class MultiAgentATCEnvironment:
         if randomize:
             task = self._randomize_task(task, episode_id)
 
-        profile = supervisor_profile or self._supervisor.sample_profile(episode_id)
+        profile = supervisor_profile or SupervisorProfileName.SAFETY_STRICT
         atfm = self._build_atfm_deadlines(task)
 
         self._state = EpisodeState(
@@ -247,12 +244,10 @@ class MultiAgentATCEnvironment:
 
         aman_reward  = self._aman_reward(per_role, outcome.metrics, state)
         dman_reward  = self._dman_reward(per_role, outcome.metrics, state)
-        supervisor_score = self._supervisor.score_plan(
-            outcome, state.task, state.supervisor_profile
-        )
-        # Generator reward: adversarial (1 - controller avg), penalised if unsolvable
+        # Generator reward: adversarial (1 - controller avg)
         controller_avg = (aman_reward + dman_reward) / 2.0
         generator_reward = max(-1.0, 1.0 - controller_avg)
+        supervisor_score = 0.0  # supervisor removed from active training pipeline
 
         return MultiAgentEpisodeResult(
             task_id=state.task.task_id,
@@ -538,16 +533,6 @@ class MultiAgentATCEnvironment:
                         score += 0.25
                         break
 
-        # Reward proposed alternatives that were actually adopted in the final plan.
-        # This incentivises agents to offer concrete fallbacks, not just claim slots.
-        final_slots = {(s.flight_id, s.runway) for s in state.aman_slots + state.dman_slots}
-        all_messages = state.aman_messages + state.dman_messages
-        for msg in all_messages:
-            for alt in msg.proposed_alternatives:
-                if (alt.flight_id, alt.runway_id) in final_slots:
-                    score += 0.15
-                    break  # one bonus per message at most
-
         return round(min(1.0, score), 4)
 
     # ── Per-agent reward functions ────────────────────────────────────────────
@@ -584,23 +569,12 @@ class MultiAgentATCEnvironment:
         # 5. Cross-lane conflict penalty
         cross_penalty = 0.15 * per_role.cross_lane_conflicts
 
-        # 6. Supervisor preference alignment (partial)
-        profile = SUPERVISOR_PROFILES[state.supervisor_profile]
-        w_conflict = profile.get("conflict_weight", 1.0) / 3.0
-        w_priority = profile.get("priority_weight", 1.0) / 3.5
-
-        supervisor_adj = (
-            w_priority * emg_score * 0.1
-            - w_conflict * cross_penalty * 0.1
-        )
-
         raw = (
             0.35 * delay_score
             + 0.25 * emg_score
             + 0.20 * coverage
             + 0.15 * coord
             + 0.05 * max(0.0, 1.0 - cross_penalty)
-            + supervisor_adj
         )
         return round(max(0.0, min(1.0, raw)), 4)
 
@@ -641,21 +615,12 @@ class MultiAgentATCEnvironment:
         # 6. Cross-lane conflict penalty
         cross_penalty = 0.15 * per_role.cross_lane_conflicts
 
-        profile = SUPERVISOR_PROFILES[state.supervisor_profile]
-        w_conflict = profile.get("conflict_weight", 1.0) / 3.0
-        w_fuel = profile.get("fuel_weight", 1.0) / 2.5
-
-        # Fuel penalty via ATFM: missing ATFM slots causes upstream fuel burn
-        fuel_adj = w_fuel * atfm_score * 0.1
-
         raw = (
             0.30 * delay_score
-            + 0.20 * atfm_score
+            + 0.25 * atfm_score
             + 0.20 * emg_score
             + 0.15 * coverage
             + 0.10 * coord
-            + 0.05 * max(0.0, 1.0 - cross_penalty)
-            + fuel_adj
         )
         return round(max(0.0, min(1.0, raw)), 4)
 

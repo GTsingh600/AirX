@@ -76,34 +76,41 @@ from training.reward_functions import (
 )
 from multi_agent.environment import MultiAgentATCEnvironment
 from multi_agent.models import AgentRole, SupervisorProfileName
-from multi_agent.supervisor import SupervisorAgent
 from tasks import task_catalog, ordered_tasks
 
 
-# ── Hyperparameters — ADAPT-focused, 1.5B/7B-stable ──────────────────────────
+# ── Hyperparameters — ADAPT-first, 1.5B-optimised ────────────────────────────
 #
-# Tuned for stable convergence on T4 Colab with Qwen2.5-1.5B to 7B.
-# ADAPT is the primary training role. AMAN/DMAN are support roles.
-# Lower LR + higher grad_accum = more stable updates.
+# Tuned for stable convergence on T4/A100 Colab with Qwen2.5-1.5B.
+# ADAPT is the PRIMARY training role (~65% of samples).
+# AMAN/DMAN are support roles for JSON format only (micro tasks, short context).
+#
+# 1.5B memory budget on T4 (16 GB):
+#   4-bit quant: ~900 MB model | LoRA rank=8: ~50 MB | seq_len=1024: ~1.5 GB
+#   Leaves ~13 GB for activations + batch — comfortable at batch=2, accum=4.
+#
+# To run on 7B instead: --lora_rank 16 --episodes 300 (seq_len auto-adjusts)
 
 DEFAULT_MODEL  = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_OUTPUT = "./outputs/atc-adapt"
 
-# QLoRA config — all 7 projection types, moderate rank
-LORA_RANK    = 32
-LORA_ALPHA   = 64   # 2x rank keeps adapter scale stable
+# QLoRA config — all 7 projection types
+# rank=8 for 1.5B: ~0.4% trainable params, fast convergence on simple structure task
+# rank=16 for 7B:  --lora_rank 16
+LORA_RANK    = 8
+LORA_ALPHA   = 16   # 2x rank
 LORA_TARGETS = [
     "q_proj", "v_proj", "k_proj", "o_proj",   # attention
     "gate_proj", "up_proj", "down_proj",       # FFN / MLP
 ]
 
-MAX_SEQ_LEN    = 1536   # save VRAM for batch size headroom
-MAX_NEW_TOKENS = 384    # ADAPT outputs ~150 tokens
-TEMPERATURE    = 0.8    # slightly more exploration
+MAX_SEQ_LEN    = 1024   # 1.5B sweet spot: fits T4 VRAM, covers all micro+ADAPT prompts
+MAX_NEW_TOKENS = 192    # ADAPT output ~120 tokens, micro AMAN/DMAN ~150; 192 is safe
+TEMPERATURE    = 0.8    # exploration for GRPO group diversity
 N_GENERATIONS  = 2      # T4 practical max
 BATCH_SIZE     = 2
-GRAD_ACCUM     = 8      # effective batch = 16 for stable gradients
-LR             = 5e-6   # low LR prevents reward collapse — key fix
+GRAD_ACCUM     = 4      # effective batch = 8 — faster iteration vs 16
+LR             = 5e-6   # low LR prevents reward collapse
 KL_COEFF       = 0.0    # keep 0.0 — non-zero KL crashes Unsloth+PEFT
 WARMUP_RATIO   = 0.10   # longer warmup for early gradient stability
 SAVE_STEPS     = 50
@@ -473,8 +480,8 @@ def train(
               f" / DMAN {base_model_metrics['mean_dman_reward']:.3f})")
 
     # ── 3. Build ADAPT-focused training dataset ────────────────────────────────
-    print(f"\n[2/5] Building {n_episodes}-episode ADAPT-focused dataset...")
-    print(f"      ADAPT domain ratio=0.50  |  Generator=OFF  |  Supervisor=OFF")
+    print(f"\n[2/5] Building {n_episodes}-episode ADAPT-first dataset...")
+    print(f"      ADAPT domain ratio=0.65  |  Generator=OFF  |  Supervisor=OFF")
     t0 = time.time()
     dataset_raw = build_episode_dataset(
         n_episodes=n_episodes,
@@ -482,7 +489,7 @@ def train(
         include_generator=False,
         include_supervisor=False,
         include_adapt=True,
-        domain_episode_ratio=0.50,      # 50% domain-transfer ADAPT episodes
+        domain_episode_ratio=0.65,      # 65% domain-transfer ADAPT episodes (primary role)
         long_horizon_ratio=0.0,         # disabled for stable convergence
     )
     print(f"    Dataset: {len(dataset_raw)} samples ({time.time()-t0:.1f}s)")
@@ -720,7 +727,6 @@ def _quick_heuristic_eval(n_episodes: int = 6) -> Dict[str, Any]:
     from multi_agent.inference import run_episode as _run_ep
 
     env = MultiAgentATCEnvironment(seed=99)
-    sup = SupervisorAgent()
 
     # Fixed task list — no generator mutations for a stable repeatable baseline
     eval_tasks = ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
@@ -735,7 +741,6 @@ def _quick_heuristic_eval(n_episodes: int = 6) -> Dict[str, Any]:
                 client       = None,   # heuristic mode — no LLM
                 env          = env,
                 generator    = None,
-                supervisor   = sup,
                 episode_id   = ep,
                 use_generator= False,
             )
@@ -864,7 +869,6 @@ def _run_model_episodes(
 
     client = _LocalModelClient(model, tokenizer)
     env = MultiAgentATCEnvironment(seed=77)
-    sup = SupervisorAgent()
 
     # Two representative tasks: one easy, one hard
     eval_tasks = ["delhi_monsoon_recovery_easy", "bengaluru_irrops_hard"]
@@ -879,7 +883,6 @@ def _run_model_episodes(
                 client=client,
                 env=env,
                 generator=None,
-                supervisor=sup,
                 episode_id=ep,
                 use_generator=False,
                 model_name="local",
@@ -985,7 +988,7 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
     from training.dataset import AMAN_SYSTEM, DMAN_SYSTEM, SUPERVISOR_PROFILES
 
     env        = MultiAgentATCEnvironment(seed=seed)
-    supervisor = SupervisorAgent()
+    _profiles  = list(SupervisorProfileName)
     task_list  = list(ordered_tasks())
     rng        = random.Random(seed)
 
@@ -996,7 +999,7 @@ def evaluate(model_name_or_path: str, n_episodes: int = 20, seed: int = 99) -> D
 
     for ep in range(n_episodes):
         base_task = rng.choice(task_list)
-        profile   = supervisor.sample_profile(ep)
+        profile   = _profiles[ep % len(_profiles)]
 
         aman_obs, dman_obs = env.reset(episode_id=ep, mutated_task=base_task)
         sup_desc = SUPERVISOR_PROFILES[profile]["description"]

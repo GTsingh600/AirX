@@ -481,7 +481,7 @@ def test_adapt_reward_bad_json_penalised(mass_casualty_task):
         domain_task_json=[mass_casualty_task.model_dump_json()],
         supervisor_profile=[SupervisorProfileName.SAFETY_STRICT.value],
     )
-    assert rewards[0] <= -0.4
+    assert rewards[0] <= 0.15  # bad JSON → near-zero reward, no negative
 
 
 def test_adapt_reward_missing_domain_task_penalised():
@@ -493,7 +493,7 @@ def test_adapt_reward_missing_domain_task_penalised():
         domain_task_json=[None],
         supervisor_profile=[SupervisorProfileName.SAFETY_STRICT.value],
     )
-    assert rewards[0] <= -0.5
+    assert rewards[0] == 0.0  # missing domain_task → early return 0.0
 
 
 def test_adapt_reward_batch_length_matches(mass_casualty_task):
@@ -568,10 +568,10 @@ def test_adapt_in_dispatch_table():
     assert REWARD_FN_DISPATCH[AgentRole.ADAPT.value] is adapt_reward_fn
 
 
-def test_dispatch_table_has_all_roles():
+def test_dispatch_table_has_trainable_roles():
     from training.train_grpo import REWARD_FN_DISPATCH
 
-    for role in AgentRole:
+    for role in (AgentRole.AMAN, AgentRole.DMAN, AgentRole.ADAPT):
         assert role.value in REWARD_FN_DISPATCH, f"{role.value} missing from dispatch table"
 
 

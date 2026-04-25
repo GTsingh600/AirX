@@ -53,7 +53,6 @@ from multi_agent.models import (
     SupervisorProfileName,
     SUPERVISOR_PROFILES,
 )
-from multi_agent.supervisor import SupervisorAgent
 from training.dataset import (
     AMAN_SYSTEM,
     DMAN_SYSTEM,
@@ -381,26 +380,23 @@ def _save_transcript(
         _p(f"[WARN] Could not save transcript for episode {episode_id}: {exc}")
 
 
+_PROFILE_LIST = list(SupervisorProfileName)
+
+
 def run_episode(
     task_id: str,
     client,
     env: MultiAgentATCEnvironment,
     generator: Optional[ChallengeGenerator],
-    supervisor: SupervisorAgent,
     episode_id: int,
     use_generator: bool = True,
     model_name: Optional[str] = None,
     transcript_dir: Optional[Path] = None,
 ) -> Dict:
-    """Run one full AMAN/DMAN episode. Returns result dict for logging.
-
-    Args:
-        transcript_dir: If set, writes a JSON transcript of the full episode
-            (actions, messages, rewards, metadata) to this directory.
-    """
+    """Run one full AMAN/DMAN episode. Returns result dict for logging."""
     catalog  = task_catalog()
     base_task = catalog.get(task_id, list(catalog.values())[0])
-    profile   = supervisor.sample_profile(episode_id)
+    profile   = _PROFILE_LIST[episode_id % len(_PROFILE_LIST)]
     sup_desc  = SUPERVISOR_PROFILES[profile]["description"]
 
     mutations_applied: List[str] = []
@@ -542,7 +538,6 @@ def run_domain_episode(
     domain_task_id: str,
     client,
     env: MultiAgentATCEnvironment,
-    supervisor: SupervisorAgent,
     episode_id: int,
     model_name: Optional[str] = None,
     transcript_dir: Optional[Path] = None,
@@ -551,9 +546,6 @@ def run_domain_episode(
 
     ADAPT maps the domain task → ATC-parameterised task.
     AMAN and DMAN then solve it with no code changes.
-
-    Args:
-        domain_task_id: Key from the domains registry, e.g. 'icu_mass_casualty'.
     """
     from domains import get_all_domain_tasks, get_domain_description
     from multi_agent.adapt import (
@@ -572,7 +564,7 @@ def run_domain_episode(
         )
 
     domain_task = all_domain_tasks[domain_task_id]
-    profile     = supervisor.sample_profile(episode_id)
+    profile     = _PROFILE_LIST[episode_id % len(_PROFILE_LIST)]
     sup_desc    = SUPERVISOR_PROFILES[profile]["description"]
 
     # ── ADAPT step ────────────────────────────────────────────────────────────
@@ -702,7 +694,6 @@ def main() -> None:
 
     env       = MultiAgentATCEnvironment(seed=args.seed)
     generator = ChallengeGenerator(seed=args.seed)
-    supervisor = SupervisorAgent()
 
     transcript_dir = Path(args.transcript_dir) if args.transcript_dir else None
 
@@ -724,7 +715,6 @@ def main() -> None:
                 domain_task_id=args.domain,
                 client=client,
                 env=env,
-                supervisor=supervisor,
                 episode_id=ep,
                 model_name=model,
                 transcript_dir=transcript_dir,
@@ -757,7 +747,6 @@ def main() -> None:
                 model_name=model,
                 env=env,
                 generator=generator,
-                supervisor=supervisor,
                 episode_id=ep,
                 use_generator=not args.no_generator,
                 transcript_dir=transcript_dir,
