@@ -343,7 +343,15 @@ def train_sft(
             print(f"  [WARN] merge_and_unload failed ({e2}), saving raw LoRA checkpoint")
             model.save_pretrained(final_dir)
             tokenizer.save_pretrained(final_dir)
-    print(f"  SFT checkpoint (merged) saved to: {final_dir}")
+    # Remove stale PEFT config files — merged model has no adapters,
+    # but save_pretrained_merged sometimes leaves adapter_config.json behind,
+    # which causes GRPO's get_peft_model to fail with "already has LoRA".
+    for _stale in ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"]:
+        _stale_path = os.path.join(final_dir, _stale)
+        if os.path.exists(_stale_path):
+            os.remove(_stale_path)
+            print(f"  Removed stale {_stale} (merged model, no adapters)")
+    print(f"  SFT checkpoint (merged, clean) saved to: {final_dir}")
     print(f"  Use this as --model for GRPO: python training/train_grpo.py --model {final_dir}")
 
     return final_dir

@@ -444,6 +444,18 @@ def train(
     # This is the maximum expressiveness achievable inside Unsloth's stable
     # compiled GRPO path — raw full-model (no PEFT) crashes torch._dynamo.
     print(f"[1/5] Loading model with Unsloth 4-bit QLoRA (rank={lora_rank}, all projections)...")
+
+    # If loading from a merged SFT checkpoint, save_pretrained_merged may have
+    # left behind adapter_config.json without actual adapter weights.
+    # That causes PEFT to initialise a LoRA structure → Unsloth then blocks
+    # get_peft_model with "already has LoRA adapters".  Strip it first.
+    if os.path.isdir(model_name):
+        for _stale in ["adapter_config.json", "adapter_model.safetensors", "adapter_model.bin"]:
+            _stale_path = os.path.join(model_name, _stale)
+            if os.path.exists(_stale_path):
+                os.remove(_stale_path)
+                print(f"  [INFO] Stripped stale {_stale} from merged SFT checkpoint")
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_name,
         max_seq_length=MAX_SEQ_LEN,
